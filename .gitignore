@@ -1,0 +1,4 @@
+node_modules/
+test/signed.pdf
+*.local.*
+.DS_Store
