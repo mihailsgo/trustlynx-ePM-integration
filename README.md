@@ -53,11 +53,12 @@ Code examples are JavaScript (Node 18+, which provides global `fetch`, `FormData
 6. [Authentication](#6-authentication)
 7. [One-time service configuration](#7-one-time-service-configuration)
 8. [Step-by-step API reference](#8-step-by-step-api-reference)
-9. [Start-request parameters](#9-start-request-parameters)
-10. [Signing result states](#10-signing-result-states)
-11. [End-to-end test](#11-end-to-end-test)
-12. [Troubleshooting](#12-troubleshooting)
-13. [Notes for production](#13-notes-for-production)
+9. [Implementing the middleware: the return pages](#9-implementing-the-middleware-the-return-pages)
+10. [Start-request parameters](#10-start-request-parameters)
+11. [Signing result states](#11-signing-result-states)
+12. [End-to-end test](#12-end-to-end-test)
+13. [Troubleshooting](#13-troubleshooting)
+14. [Notes for production](#14-notes-for-production)
 - [Appendix A. Endpoint quick reference](#appendix-a-endpoint-quick-reference)
 - [Appendix B. Glossary](#appendix-b-glossary)
 
@@ -166,9 +167,9 @@ Three things to internalize before writing code:
   24.3.0.56). Your return pages should check that the `state` coming back from LVRTC matches
   the one you started with, and reject mismatches.
 - **The session lives for 10 minutes.** The signing session is held in the service's in-memory
-  cache with a 10-minute expiry (configurable via `hazelcast.expireInminutes`). The signer must
-  complete both LVRTC rounds within that window, otherwise steps 4 or 6 return `401` and the
-  cycle must be restarted from step 2.
+  cache with a 10-minute expiry (the service default; the platform operator can change it). The
+  signer must complete both LVRTC rounds within that window, otherwise steps 4 or 6 return
+  `401` and the cycle must be restarted from step 2.
 
 ---
 
@@ -178,10 +179,9 @@ Three things to internalize before writing code:
 works you need, from LVRTC (arranged during onboarding, together with TrustLynx where
 applicable):
 
-| Item | Used as |
+| Item | Where it goes |
 |---|---|
-| Client ID | `lvrtc.clientId` in the service configuration |
-| Client secret | `lvrtc.clientSecret` in the service configuration |
+| Client ID and client secret | Configured once on the Container Service ([section 7](#7-one-time-service-configuration)); your application never handles them |
 | Registered redirect URI(s) | The exact HTTPS URLs of your return pages; LVRTC only redirects to pre-registered URIs |
 | Access to the LVRTC integration environment | Test credentials and environment details come with the agreement |
 
@@ -266,8 +266,8 @@ fetches the document and computes the digest. Get a token the same way as in the
 manual (Keycloak `client_credentials` against your realm).
 
 The `403` you can meet on the signing endpoints is not an authentication failure of yours: an
-empty-body `403` from any `/signing/lvrtc/*` endpoint means the service itself has no
-`lvrtc.clientId` configured (see [section 7](#7-one-time-service-configuration)).
+empty-body `403` from any `/signing/lvrtc/*` endpoint means the service itself has no LVRTC
+client ID configured (see [section 7](#7-one-time-service-configuration)).
 
 ---
 
@@ -292,7 +292,7 @@ lvrtc:
 Notes:
 
 - `authRedirectUri` / `signRedirectUri` here are only **defaults**. Your application can
-  override them per signing request (see [section 9](#9-start-request-parameters)); every value
+  override them per signing request (see [section 10](#10-start-request-parameters)); every value
   used must be registered with LVRTC either way. If your application always passes its own,
   the configured defaults are effectively documentation.
 - The delivery's placeholder block points the redirect URIs at a TrustLynx demo portal. Replace
@@ -364,7 +364,7 @@ Success returns `{ "id": "<uuid>", ... }`; `id` is the document ID used everywhe
 | **Body** | optional JSON (visible-signature attributes; omit for an invisible signature) |
 | **Response** | up to 24.3.0.49: `302 Found`, `Location` header (LVRTC auth URL), JSON body `{ "sessionId": "<state>" }`. From 24.3.0.56: `200 OK`, `Location` and `session-id` headers, empty body |
 
-All inputs are query parameters (full list in [section 9](#9-start-request-parameters)). Either
+All inputs are query parameters (full list in [section 10](#10-start-request-parameters)). Either
 way the LVRTC auth URL is in the `Location` header, so with redirect-following disabled the
 same client code handles both versions. A typical start:
 
@@ -399,7 +399,7 @@ service; shown so you recognize it in logs):
 
 ```
 https://eidas.eparaksts.lv/trustedx-authserver/oauth/lvrtc-eipsign-as
-  ?client_id=<lvrtc.clientId>
+  ?client_id=<the client ID configured on the service>
   &redirect_uri=<authRedirectUri>
   &response_type=code
   &state=<state>
@@ -444,7 +444,8 @@ LVRTC then redirects the browser to your `authRedirectUri`:
 https://<your-app>/epm/return/auth?code=<one-time-code>&state=<state>
 ```
 
-Your return page hands `code` and `state` to your back end for step 4. Two rules:
+Your return page hands `code` and `state` to your back end for step 4 (a complete return-page
+implementation is in [section 9](#9-implementing-the-middleware-the-return-pages)). Two rules:
 
 - **Verify `state`** matches a signing you actually started, and drop the request otherwise.
 - **Use the code immediately.** Authorization codes are one-time and short-lived.
@@ -578,7 +579,7 @@ do {
   );
   result = (await res.json()).result;
 } while (result === "SIGNING_IN_PROGRESS" || result === "SIGNING_STARTED");
-// result is now SIGNING_COMPLETED or an error state (section 10)
+// result is now SIGNING_COMPLETED or an error state (section 11)
 ```
 
 Unlike the Smart-ID status endpoint, there is no long-poll variant here; poll at a modest
@@ -613,7 +614,137 @@ eParaksts validation tools.
 
 ---
 
-## 9. Start-request parameters
+## 9. Implementing the middleware: the return pages
+
+The parts of the flow your application owns form a thin middleware layer between the signer's
+browser and the signing API: the button handler that starts the signing, and the return page(s)
+that LVRTC redirects back to. Section 8 documented the individual calls; this section shows
+them assembled into working handlers, because the return page is where most integration
+questions live. The example is Node + Express for consistency with the rest of the manual, but
+the structure maps one-to-one to any stack.
+
+The middleware has three responsibilities:
+
+1. **A server-side record per signing, keyed by `state`.** Created when the signing starts,
+   holding at least the document ID and which leg the flow is on (`auth` or `sign`). This
+   record is what lets the return page decide what to do when a callback arrives; nothing else
+   about the flow needs to be remembered between requests.
+2. **The return page handler.** LVRTC lands on it twice per signing with `code` + `state`. It
+   validates `state` against the records, dispatches on the leg, makes one server-side API
+   call, and redirects the browser onward. It renders nothing itself except error messages and
+   the final outcome.
+3. **Keeping the signing API server-side.** All calls to the Container Service happen from your
+   back end. The browser only ever navigates between your pages and LVRTC; it never talks to
+   the signing API directly.
+
+```js
+import express from "express";
+import { randomUUID } from "node:crypto";
+
+const app = express();
+const CONTAINER_BASE = "https://<your-host>/container/api";
+const RETURN_URL = "https://<your-app>/epm/return"; // registered with LVRTC
+
+// One record per signing, keyed by state. Use a shared store (DB, Redis) in
+// production, with a TTL matching the 10-minute signing session.
+const signings = new Map(); // state -> { docId, leg, signer }
+
+// The "Sign" button handler. The document is already in the archive (step 1).
+app.post("/documents/:docId/sign", async (req, res) => {
+  const state = randomUUID();
+  const params = new URLSearchParams({
+    state,
+    locale: "lv",
+    authRedirectUri: RETURN_URL,
+    signRedirectUri: RETURN_URL,
+    acrValues: "urn:eparaksts:authentication:flow:mobileid",
+  });
+
+  const start = await fetch(
+    `${CONTAINER_BASE}/signing/lvrtc/pdf/${encodeURIComponent(req.params.docId)}/sign?${params}`,
+    { method: "POST", redirect: "manual" }
+  );
+  const authUrl = start.headers.get("location");
+  if (!authUrl) return res.status(502).send("Could not start signing.");
+
+  signings.set(state, { docId: req.params.docId, leg: "auth" });
+  setTimeout(() => signings.delete(state), 10 * 60 * 1000);
+
+  res.redirect(authUrl); // the browser leaves for LVRTC here
+});
+
+// The return page. LVRTC lands here twice per signing.
+app.get("/epm/return", async (req, res) => {
+  const { state, code, error } = req.query;
+  const signing = signings.get(state);
+
+  if (!signing) return res.status(410).send("Unknown or expired signing session. Start again.");
+  if (error) {
+    signings.delete(state);
+    return res.send(`Signing was not completed (${error}). You can start again.`);
+  }
+
+  if (signing.leg === "auth") {
+    // Leg 1: exchange the code, learn who is signing, send the browser onward.
+    const r = await fetch(
+      `${CONTAINER_BASE}/signing/lvrtc/signing-identity?` + new URLSearchParams({ state, code }),
+      { method: "POST", redirect: "manual" }
+    );
+    const identity = await r.json().catch(() => ({}));
+    const signUrl = identity.location || r.headers.get("location");
+    if (!signUrl) {
+      signings.delete(state);
+      return res.status(410).send("Session expired or code rejected. Start again.");
+    }
+
+    // The place to enforce WHO signs, before any signature exists:
+    // if (identity.serialNumber !== await expectedSignerFor(signing.docId)) { ...abort... }
+    signing.leg = "sign";
+    signing.signer = identity.serialNumber;
+    return res.redirect(signUrl); // back to LVRTC for the signing confirmation
+  }
+
+  // Leg 2: finalize. Blocks up to 60 s for a single document.
+  const r = await fetch(
+    `${CONTAINER_BASE}/signing/lvrtc/signature?` + new URLSearchParams({ state, code }),
+    { method: "POST" }
+  );
+  const outcome = await r.json().catch(() => ({}));
+  signings.delete(state);
+
+  if (outcome.result === "SIGNING_COMPLETED") {
+    return res.redirect(`/documents/${signing.docId}/signed`); // your "done" page
+  }
+  return res.status(502).send(`Signing did not complete (${outcome.result || r.status}).`);
+});
+```
+
+What the example demonstrates, and what to keep when porting it to your stack:
+
+- **One return URL serves both legs.** LVRTC does not tell you which round-trip you are on;
+  the `leg` field of your own record decides. If you prefer two separate URLs, register both
+  and the dispatch becomes the route instead of the field, everything else stays the same.
+- **A refresh on the return page is harmless.** Codes are one-time: the repeated exchange is
+  rejected upstream, the handler falls into its "expired or rejected" branch, and no side
+  effect runs twice. That property comes from dispatching on the server-side record rather
+  than on anything the browser sends.
+- **Leg 2 is the slow one.** The finalize call holds the request while the service assembles
+  and stores the signature (up to 60 seconds worst case). If a long page load is unacceptable,
+  respond immediately with a "finishing..." page that polls your back end, and have your back
+  end poll the session status (step 6a) instead.
+- **The identity checkpoint is leg 1's main value.** `identity.serialNumber` carries the
+  signer's personal code. Compare it against who you expect *before* redirecting to the
+  signing confirmation; after leg 2 a qualified signature already exists on the document.
+- **Auth forwarding.** If your archive enforces JWT ([section 6](#6-authentication)), add the
+  same `Authorization` header to the three Container Service calls in the example.
+- **Failure UX.** Every terminal branch above leaves the user on a page that says what
+  happened and offers to start again. Since sessions expire after 10 minutes, "start again"
+  (a fresh step 2 with a fresh `state`) is always the correct recovery, and the unsigned
+  document is still in the archive under the same ID.
+
+---
+
+## 10. Start-request parameters
 
 Query parameters accepted by all start endpoints (`/pdf/{id}/sign`, `/document/{id}/sign`,
 `/container/{id}/sign`, `/document/batch/sign`):
@@ -621,9 +752,9 @@ Query parameters accepted by all start endpoints (`/pdf/{id}/sign`, `/document/{
 | Parameter | Required | Default | Meaning |
 |---|---|---|---|
 | `state` | no | generated UUID | Session key for the whole cycle. Supply your own random UUID to correlate callbacks with your records, or read the generated one from the start response (JSON `sessionId` up to 24.3.0.49, `session-id` header from 24.3.0.56). Ignored by `batch/sign` (always generated). |
-| `authRedirectUri` | no | `lvrtc.authRedirectUri` from config | Return URL for the authentication leg. Must be registered with LVRTC. |
-| `signRedirectUri` | no | `lvrtc.signRedirectUri` from config | Return URL for the signing leg. Must be registered with LVRTC. Pass together with `authRedirectUri` or not at all. |
-| `locale` | no | `lvrtc.defaultLocale` (`lv`) | Language of the LVRTC pages: `lv`, `en`, or `ru`. |
+| `authRedirectUri` | no | service-configured default | Return URL for the authentication leg. Must be registered with LVRTC. |
+| `signRedirectUri` | no | service-configured default | Return URL for the signing leg. Must be registered with LVRTC. Pass together with `authRedirectUri` or not at all. |
+| `locale` | no | service-configured default (`lv`) | Language of the LVRTC pages: `lv`, `en`, or `ru`. |
 | `acrValues` | no | service configuration | Authentication method hint. Use `urn:eparaksts:authentication:flow:mobileid` for eParaksts Mobile (recommended to pass explicitly); `urn:eparaksts:authentication:flow:sc_plugin` selects the eID smart-card flow instead. |
 | `signatureProfile` | no | `LT` | Signature level for ASiC-E container signing (`B`, `T`, `LT`, `LTA`). For PDF signing the level comes from the service default (PAdES-BASELINE-LT) or the request body's `signatureProfile` (for example `PAdES_BASELINE_B`). |
 | `role` | no | empty | Signer role text embedded in the signature. |
@@ -640,7 +771,7 @@ Optional extras:
 
 ---
 
-## 10. Signing result states
+## 11. Signing result states
 
 The `result` field of the step 6 response and the status endpoint:
 
@@ -661,7 +792,7 @@ Failures **before** finalization surface differently, as HTTP codes on the API c
 
 ---
 
-## 11. End-to-end test
+## 12. End-to-end test
 
 The [test kit](test/) drives the whole cycle from one terminal. The two browser legs cannot be
 automated (a human confirms in the eParaksts app), so the script prints each LVRTC URL for you
@@ -684,12 +815,12 @@ embedded PAdES signature.
 
 ---
 
-## 12. Troubleshooting
+## 13. Troubleshooting
 
 | Symptom | Cause and fix |
 |---|---|
 | Start or `signing-identity` call returns LVRTC's HTML page instead of headers/JSON | Your HTTP client followed the `302` redirect to `eidas.eparaksts.lv`. Disable redirect-following for these calls (`redirect: "manual"` in fetch, `CURLOPT_FOLLOWLOCATION` off, etc.) and read the `Location` header. |
-| `403` (empty body) on any signing call | `lvrtc.clientId` is empty on the Container Service. Configure the LVRTC block and restart ([section 7](#7-one-time-service-configuration)). |
+| `403` (empty body) on any signing call | The LVRTC client ID is not configured on the Container Service. Apply the one-time configuration and restart ([section 7](#7-one-time-service-configuration)). |
 | LVRTC shows an error instead of the login page | Redirect URI not registered with LVRTC (or differs from the registered value), or wrong `client_id`. Compare the `redirect_uri` in the `Location` URL character-for-character with the LVRTC registration. |
 | `401` from `signing-identity` | Auth code expired or already used, `state` unknown (10-minute session expired), or the auth-leg redirect URI does not match between the authorize call and the LVRTC registration. Restart from step 2. |
 | `401` from `signature` | Same causes on the signing leg. Also occurs when only one of `authRedirectUri` / `signRedirectUri` was passed at start ([step 2](#step-2-start-epm-signing) note). |
@@ -703,7 +834,7 @@ embedded PAdES signature.
 
 ---
 
-## 13. Notes for production
+## 14. Notes for production
 
 - **Protect the signing API.** In the default delivery, `/container/api` (and the service's
   host port) accept unauthenticated calls. The ePM endpoints are keyed only by `state`, so
@@ -727,8 +858,9 @@ embedded PAdES signature.
   keep them out of application logs. The service itself logs mode and session information
   without credentials.
 - **LVRTC environments.** Do the first integration against the LVRTC test environment from
-  your agreement, then switch `lvrtc.baseUri`, credentials, and registered URIs to production
-  values. The flow and endpoints are identical.
+  your agreement, then have the service configuration switched to the production environment,
+  credentials, and registered URIs ([section 7](#7-one-time-service-configuration)). The flow
+  and endpoints are identical.
 
 ---
 

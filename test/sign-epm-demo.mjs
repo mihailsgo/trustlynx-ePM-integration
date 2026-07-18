@@ -186,8 +186,8 @@ async function startSigning(docId, state) {
   });
   if (res.status === 403) {
     throw new Error(
-      "HTTP 403: the Container Service has no lvrtc.clientId configured. " +
-      "Apply the LVRTC block in application.yml and restart the service (manual, section 7)."
+      "HTTP 403: the Container Service has no LVRTC client ID configured. " +
+      "Apply the one-time service configuration and restart it (manual, section 7)."
     );
   }
   const authUrl = res.headers.get("location");

@@ -79,5 +79,5 @@ OK: cycle completed, signed PDF downloaded.
 Mind the clock: the signing session expires 10 minutes after step 2, so complete both browser
 legs within that window or the script fails with a 401 and you start over.
 
-> An immediate `403` at step 2 means the Container Service has no `lvrtc.clientId` configured.
-> Apply the LVRTC block from section 7 of the manual and restart the service.
+> An immediate `403` at step 2 means the Container Service has no LVRTC client ID configured.
+> Apply the one-time configuration from section 7 of the manual and restart the service.
